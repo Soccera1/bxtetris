@@ -1,0 +1,338 @@
+#!/bin/bash
+
+if (( BASH_VERSINFO[0] < 5 )); then
+    printf 'bxtetris requires Bash 5 or newer.\n' >&2
+    exit 1
+fi
+export LC_ALL=C
+if [[ $0 == */* ]]; then
+    source "${0%/*}/x11.bash" || exit 1
+else
+    source ./x11.bash || exit 1
+fi
+
+if [[ ${1-} == --help || ${1-} == -h ]]; then
+    printf '%s\n' 'Usage: bxtetris' 'Play a falling-block game on the X11 display in DISPLAY.' \
+        'Arrows or A/S/D/X move and rotate. Z rotates back. Space drops.' \
+        'P pauses, R restarts, and Esc or Q quits.'
+    exit 0
+fi
+(( $# == 0 )) || x11_die 'use --help for usage'
+trap 'exit 0' INT TERM
+trap 'x11_die "X11 connection lost"' PIPE
+
+readonly columns=10 rows=20 cell_size=22
+readonly board_x=24 board_y=44 window_width=430 window_height=510
+
+# One bit per cell, in row-major order on a 4x4 grid. Each row
+# below holds the four quarter-turns of one piece.
+shapes=(
+    0x00f0 0x4444 0x0f00 0x2222  # I
+    0x0071 0x0226 0x0470 0x0322  # J
+    0x0074 0x0622 0x0170 0x0223  # L
+    0x0066 0x0066 0x0066 0x0066  # O
+    0x0036 0x0462 0x0360 0x0231  # S
+    0x0072 0x0262 0x0270 0x0232  # T
+    0x0063 0x0264 0x0630 0x0132  # Z
+)
+
+readonly backdrop=0 panel=1 well=2 grid=3 landing=4 ink=5 secondary=6 accent=7
+readonly piece_color=8
+palette=(
+    0x12171c 0x242d35 0x171e25 0x25313b 0x3c4c59 0xf0eee5 0xa6b6c1 0xe9bd78
+    0x65c9d1 0x7092e4 0xe9a66b 0xe6cd75 0x91c88d 0xbea0de 0xe88e93
+)
+
+clock_ms() {
+    local timestamp=${EPOCHREALTIME/./}
+    now=$((10#$timestamp / 1000))
+}
+
+schedule_fall() {
+    local interval=$((800 - (level-1)*65))
+    if (( interval < 90 )); then interval=90; fi
+    next_fall=$((now + interval))
+}
+
+draw_piece() {
+    local j swap previous
+    if (( bag_index == 7 )); then
+        bag=(0 1 2 3 4 5 6)
+        for (( j=6; j>0; j-- )); do
+            swap=$((RANDOM % (j+1)))
+            previous=${bag[j]}
+            bag[j]=${bag[swap]}
+            bag[swap]=$previous
+        done
+        bag_index=0
+    fi
+    upcoming=${bag[bag_index]}
+    (( bag_index += 1 ))
+}
+
+fits() {
+    local x=$1 y=$2 mask=${shapes[piece*4+$3]} bit col row
+    for (( bit=0; bit<16; bit++ )); do
+        (( mask & (1<<bit) )) || continue
+        col=$((x + bit%4))
+        row=$((y + bit/4))
+        if (( col < 0 || col >= columns || row >= rows )); then return 1; fi
+        if (( row >= 0 && board[row*columns+col] )); then return 1; fi
+    done
+    return 0
+}
+
+spawn_piece() {
+    piece=$upcoming
+    draw_piece
+    piece_x=3 piece_y=0 rotation=0
+    if ! fits "$piece_x" "$piece_y" "$rotation"; then state=over; fi
+    schedule_fall
+}
+
+new_game() {
+    local i
+    for (( i=0; i<rows*columns; i++ )); do board[i]=0; done
+    score=0 lines=0 level=1 state=running bag_index=7
+    draw_piece
+    spawn_piece
+}
+
+clear_rows() {
+    local from to=$((rows-1)) col full
+    cleared=0
+    for (( from=rows-1; from>=0; from-- )); do
+        full=1
+        for (( col=0; col<columns; col++ )); do
+            if (( board[from*columns+col] == 0 )); then
+                full=0
+                break
+            fi
+        done
+        if (( full )); then
+            (( cleared += 1 ))
+        else
+            for (( col=0; col<columns; col++ )); do
+                board[to*columns+col]=${board[from*columns+col]}
+            done
+            (( to -= 1 ))
+        fi
+    done
+    for (( ; to>=0; to-- )); do
+        for (( col=0; col<columns; col++ )); do board[to*columns+col]=0; done
+    done
+}
+
+lock_piece() {
+    local mask=${shapes[piece*4+rotation]} bit row col cleared
+    local -a line_scores=(0 100 300 500 800)
+    for (( bit=0; bit<16; bit++ )); do
+        if (( mask & (1<<bit) && piece_y + bit/4 < 0 )); then
+            state=over
+            return
+        fi
+    done
+    for (( bit=0; bit<16; bit++ )); do
+        (( mask & (1<<bit) )) || continue
+        row=$((piece_y + bit/4))
+        col=$((piece_x + bit%4))
+        board[row*columns+col]=$((piece+1))
+    done
+    clear_rows
+    (( score += line_scores[cleared]*level, lines += cleared, level = lines/10+1 ))
+    spawn_piece
+}
+
+rotate_piece() {
+    local next=$(((rotation+$1+4)%4)) i x y
+    local -a dx=(0 -1 1 -2 2 0 -1 1 0) dy=(0 0 0 0 0 -1 -1 -1 -2)
+    for i in "${!dx[@]}"; do
+        x=$((piece_x + dx[i]))
+        y=$((piece_y + dy[i]))
+        if fits "$x" "$y" "$next"; then
+            piece_x=$x piece_y=$y rotation=$next
+            return 0
+        fi
+    done
+    return 1
+}
+
+landing_row() {
+    landing_y=$piece_y
+    while fits "$piece_x" "$((landing_y+1))" "$rotation"; do
+        (( landing_y += 1 ))
+    done
+}
+
+handle_key() {
+    local action=$1 target_x
+    case $action in
+        quit) exit 0 ;;
+        restart) new_game; return 0 ;;
+        pause)
+            case $state in
+                running) state=paused ;;
+                paused) state=running; schedule_fall ;;
+                *) return 1 ;;
+            esac
+            return 0
+            ;;
+    esac
+    [[ $state == running ]] || return 1
+    case $action in
+        left|right)
+            target_x=$((piece_x+1))
+            if [[ $action == left ]]; then target_x=$((piece_x-1)); fi
+            fits "$target_x" "$piece_y" "$rotation" || return 1
+            piece_x=$target_x
+            ;;
+        down)
+            if fits "$piece_x" "$((piece_y+1))" "$rotation"; then
+                (( piece_y += 1, score += 1 ))
+                schedule_fall
+            else
+                lock_piece
+            fi
+            return 0
+            ;;
+        rotate) rotate_piece 1 ;;
+        reverse) rotate_piece -1 ;;
+        drop)
+            landing_row
+            (( score += 2*(landing_y-piece_y) ))
+            piece_y=$landing_y
+            lock_piece
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+paint_mask() {
+    local x=$1 y=$2 mask=$3 color=$4 size=$5 clip_y=$6 bit row px py
+    for (( bit=0; bit<16; bit++ )); do
+        (( mask & (1<<bit) )) || continue
+        px=$((x + bit%4*size))
+        row=$((bit/4))
+        py=$((y + row*size))
+        if (( py < clip_y )); then continue; fi
+        x11_rect "$color" "$((px+1))" "$((py+1))" "$((size-2))" "$((size-2))"
+    done
+}
+
+render() {
+    local col row index color x y
+    x11_rect "$backdrop" 0 0 "$window_width" "$window_height"
+    x11_rect "$panel" 22 42 224 444
+    x11_rect "$panel" 264 44 142 104
+    x11_rect "$panel" 264 160 142 144
+    x11_rect "$well" "$board_x" "$board_y" 220 440
+    for (( row=0; row<rows; row++ )); do
+        y=$((board_y+row*cell_size))
+        for (( col=0; col<columns; col++ )); do
+            x=$((board_x+col*cell_size))
+            index=$((row*columns+col))
+            if (( board[index] )); then
+                color=$((piece_color+board[index]-1))
+                x11_rect "$color" "$((x+1))" "$((y+1))" "$((cell_size-2))" "$((cell_size-2))"
+            else
+                x11_rect "$grid" "$((x+10))" "$((y+10))" 2 2
+            fi
+        done
+    done
+    if [[ $state == running ]]; then
+        landing_row
+        x=$((board_x+piece_x*cell_size))
+        paint_mask "$x" "$((board_y+landing_y*cell_size))" "${shapes[piece*4+rotation]}" "$landing" "$cell_size" "$board_y"
+        paint_mask "$x" "$((board_y+piece_y*cell_size))" "${shapes[piece*4+rotation]}" "$((piece_color+piece))" "$cell_size" "$board_y"
+    fi
+    paint_mask 302 93 "${shapes[upcoming*4]}" "$((piece_color+upcoming))" 16 0
+    x11_fill
+
+    x11_text "$ink" 24 26 'B X T E T R I S'
+    x11_text "$accent" 278 66 'NEXT'
+    x11_text "$secondary" 278 184 'SCORE'
+    x11_text "$ink" 278 202 "$score"
+    x11_text "$secondary" 278 228 'LINES'
+    x11_text "$ink" 278 246 "$lines"
+    x11_text "$secondary" 278 272 'LEVEL'
+    x11_text "$ink" 278 290 "$level"
+    x11_text "$accent" 264 335 'CONTROLS'
+    x11_text "$secondary" 264 356 'Arrows / A S D   Move'
+    x11_text "$secondary" 264 376 'Up / X / Z       Turn'
+    x11_text "$secondary" 264 396 'Space            Drop'
+    x11_text "$secondary" 264 416 'P                Pause'
+    x11_text "$secondary" 264 436 'R                Restart'
+    x11_text "$secondary" 264 456 'Esc / Q          Quit'
+    if [[ $state != running ]]; then
+        x11_rect "$panel" 38 225 192 70
+        x11_fill
+        if [[ $state == paused ]]; then
+            x11_text "$ink" 116 253 'PAUSED'
+            x11_text "$secondary" 83 274 'P to resume the game'
+        else
+            x11_text "$ink" 107 253 'GAME OVER'
+            x11_text "$secondary" 89 274 'R to play again'
+        fi
+    fi
+    x11_present "$window_width" "$window_height"
+}
+
+wire=
+declare -a board octet packet rectangles keys pending_events
+x11_connect
+x11_open_window "$window_width" "$window_height" bxtetris "${palette[@]}"
+x11_keymap
+clock_ms
+new_game
+render
+
+while :; do
+    clock_ms
+    timeout=1
+    if [[ $state == running ]]; then
+        if (( now >= next_fall )); then
+            if fits "$piece_x" "$((piece_y+1))" "$rotation"; then
+                (( piece_y += 1 ))
+                schedule_fall
+            else
+                lock_piece
+            fi
+            render
+        fi
+        wait_ms=$((next_fall-now))
+        if (( wait_ms > 0 )); then
+            printf -v timeout '%d.%03d' "$((wait_ms/1000))" "$((wait_ms%1000))"
+        fi
+    fi
+    if (( ${#pending_events[@]} )); then
+        IFS=' ' read -r -a packet <<< "${pending_events[0]}"
+        pending_events=("${pending_events[@]:1}")
+    else
+        x11_read "$x_fd" 32 "$timeout"
+        status=$?
+        if (( status > 128 )); then continue; fi
+        (( status == 0 )) || x11_die 'X11 connection closed'
+    fi
+    case $((packet[0] & 127)) in
+        0) x11_error ;;
+        2)
+            clock_ms
+            if handle_key "${keys[packet[1]]-}"; then render; fi
+            ;;
+        12) x11_present "$window_width" "$window_height" ;;
+        17) exit 0 ;;
+        33)
+            if (( packet[1] == 32 )); then
+                x11_get 8 4
+                if (( number == wm_protocols )); then
+                    x11_get 12 4
+                    if (( number == wm_delete )); then exit 0; fi
+                fi
+            fi
+            ;;
+        34)
+            if (( packet[1] == 1 )); then x11_keymap; fi
+            ;;
+    esac
+done
