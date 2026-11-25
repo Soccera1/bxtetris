@@ -1,6 +1,9 @@
 # X11 core protocol over a connected socket.
 
-x11_module=${BASH_SOURCE[0]%/*}/x11-unix.so
+case $OSTYPE in
+    darwin*) x11_module=${BASH_SOURCE[0]%/*}/x11-unix.dylib ;;
+    *)       x11_module=${BASH_SOURCE[0]%/*}/x11-unix.so ;;
+esac
 
 x11_die() {
     printf 'bxtetris: %s\n' "$*" >&2
@@ -137,7 +140,7 @@ x11_cookie() {
 x11_open_unix() {
     local socket=/tmp/.X11-unix/X$1
     if [[ ! -r $x11_module ]]; then
-        printf 'bxtetris: build x11-unix.so using the command in README.md\n' >&2
+        printf 'bxtetris: missing %s. See README.md for the Unix socket module.\n' "${x11_module##*/}" >&2
         return 1
     fi
     enable -f "$x11_module" bxt_x11_connect || return 1
